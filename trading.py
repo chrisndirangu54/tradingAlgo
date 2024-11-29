@@ -312,7 +312,8 @@ def advanced_hyperparameter_tuning(model, params, data):
     return grid_search.best_params_
 
 class RLTradingAgent:
-    def __init__(self, state_size, action_size, optimizer='adam'):
+    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000):
+        # Reinforcement learning parameters
         self.state_size = state_size
         self.action_size = action_size
         self.memory = deque(maxlen=2000)
@@ -322,6 +323,14 @@ class RLTradingAgent:
         self.epsilon_min = 0.01
         self.learning_rate = 0.001
         
+        # Risk management parameters
+        self.stop_loss = stop_loss
+        self.max_drawdown = max_drawdown
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.max_balance = initial_balance
+        self.drawdown = 0
+
         # Choose optimizer
         if optimizer == 'adam':
             self.optimizer = Adam(learning_rate=self.learning_rate)
@@ -342,6 +351,7 @@ class RLTradingAgent:
         return model
 
     def remember(self, state, action, reward, next_state, done):
+        """Store experiences in memory."""
         self.memory.append((state, action, reward, next_state, done))
 
     def act(self, state):
@@ -361,8 +371,28 @@ class RLTradingAgent:
             target_f = self.model.predict(state, verbose=0)
             target_f[0][action] = target
             self.model.fit(state, target_f, epochs=1, verbose=0)
+
         if self.epsilon > self.epsilon_min:
             self.epsilon *= self.epsilon_decay
+
+    def evaluate_trade(self, current_price, predicted_price):
+        """Evaluate the trade based on stop-loss and drawdown constraints."""
+        # Calculate profit/loss
+        profit_loss = current_price - predicted_price
+        if profit_loss < -self.stop_loss * current_price:
+            print("Stop-loss triggered!")
+            return False  # Stop trade
+
+        # Update balance and drawdown
+        self.balance += profit_loss
+        self.max_balance = max(self.balance, self.max_balance)
+        self.drawdown = (self.max_balance - self.balance) / self.max_balance
+        
+        if self.drawdown > self.max_drawdown:
+            print("Maximum drawdown limit reached!")
+            return False  # Stop trading
+
+        return True  # Proceed with trade
 
 # RL-enhanced Backtesting
 def backtest_with_rl(data, episodes=50, batch_size=32, initial_balance=10000):
@@ -422,33 +452,6 @@ def monte_carlo_simulation(current_price, n_simulations=1000, n_days=252, volati
     except Exception as e:
         logging.error(f"Error in Monte Carlo simulation: {e}")
         return []
-
-class TradingAgent:
-    def __init__(self, stop_loss=0.05, max_drawdown=0.2):
-        self.stop_loss = stop_loss  # 5% stop-loss
-        self.max_drawdown = max_drawdown  # Max 20% drawdown
-        self.initial_balance = 100000  # Starting capital
-        self.balance = self.initial_balance
-        self.max_balance = self.initial_balance
-        self.drawdown = 0
-
-    def evaluate_trade(self, current_price, predicted_price):
-        # Calculate potential profit or loss
-        profit_loss = current_price - predicted_price
-        if profit_loss < -self.stop_loss * current_price:
-            print("Stop-loss triggered!")
-            return False  # Stop trade
-        
-        # Update balance and drawdown
-        self.balance += profit_loss
-        self.max_balance = max(self.balance, self.max_balance)
-        self.drawdown = (self.max_balance - self.balance) / self.max_balance
-        
-        if self.drawdown > self.max_drawdown:
-            print("Maximum drawdown limit reached!")
-            return False  # Stop trading
-        
-        return True  # Proceed with trade
 
 
 # Main Workflow
