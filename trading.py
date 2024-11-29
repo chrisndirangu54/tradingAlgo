@@ -248,11 +248,7 @@ def online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1):
     # Predict for the next time step
     last_sequence = data[-look_back:].reshape(1, look_back, 1)
     return model.predict(last_sequence)[0][0]
-For Tree-Based Models (online update with HistGradientBoosting):
-You can use HistGradientBoosting which supports online learning. Here's how to modify your RandomForest forecast for online learning:
 
-python
-Copy code
 from sklearn.ensemble import HistGradientBoostingRegressor
 
 def online_random_forest_forecast(data):
