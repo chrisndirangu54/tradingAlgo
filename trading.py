@@ -295,6 +295,11 @@ def feature_importance_based_feature_engineering(data):
 
     return moving_avg
 
+def manage_overnight_risk(self):
+    if self.positions > 0:
+        self.positions = 0  # Sell all positions
+        # Adjust balance for closing these positions including costs
+
 def adjust_reward_for_risk(reward, position_size, volatility, risk_threshold=0.05):
     """Adjust the reward by penalizing high risk positions."""
     if volatility > risk_threshold:
@@ -313,7 +318,10 @@ def ensemble_models(models, data):
     meta_model.fit(np.array(predictions).T, data[-len(predictions[0]):])  # Train on the model predictions
     return meta_model.predict(np.array(predictions).T)
 
-
+def adjust_stop_loss(self, volatility):
+    """Adjust stop loss based on volatility."""
+    # Example: If volatility increases, decrease stop-loss threshold
+    self.stop_loss = max(0.01, 0.05 - (volatility * 0.1))  # Simplified, could use more complex formula
 
 # Advanced Hyperparameter Tuning
 def advanced_hyperparameter_tuning(model, params, data):
@@ -323,39 +331,68 @@ def advanced_hyperparameter_tuning(model, params, data):
     return grid_search.best_params_
 
 class RLTradingAgent:
-    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000):
+    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000,
+                 transaction_cost=0.001, slippage=0.0005):  # 0.1% transaction fee, 0.05% slippage
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=2000)
-        self.gamma = 0.95
-        self.epsilon = 1.0
-        self.epsilon_decay = 0.995
-        self.epsilon_min = 0.01
-        self.learning_rate = 0.001
+        # ... (other initializations)
+        self.transaction_cost = transaction_cost  # Transaction cost rate
+        self.slippage = slippage  # Slippage rate
+
+    def evaluate_trade(self, current_price, predicted_price, action):
+        profit_loss = current_price - predicted_price
         
-        # Risk management parameters
-        self.stop_loss = stop_loss
-        self.max_drawdown = max_drawdown
-        self.initial_balance = initial_balance
-        self.balance = initial_balance
-        self.max_balance = initial_balance
-        self.drawdown = 0
-
-        # Choose optimizer
-        if optimizer == 'adam':
-            self.optimizer = Adam(learning_rate=self.learning_rate)
-        elif optimizer == 'adamw':
-            self.optimizer = AdamW(learning_rate=self.learning_rate)
-        elif optimizer == 'rmsprop':
-            self.optimizer = RMSprop(learning_rate=self.learning_rate)
-
-        # Initialize DQN
-        self.dqn = self._build_dqn_agent()
+        # Apply transaction costs and slippage
+        if action in [0, 1]:  # Buy or Sell
+            transaction_fee = current_price * self.transaction_cost
+            slippage_cost = current_price * self.slippage
+            total_cost = transaction_fee + slippage_cost
         
-        # A3C is more complex and usually involves multiple workers
-        # Here, we'll just set up the model for A3C
-        self.a3c_model = self._build_a3c_model()
+        if action == 0:  # Buy
+            self.balance -= total_cost  # Deduct costs when buying
+        elif action == 1:  # Sell
+            profit_loss -= total_cost  # Deduct costs from profit when selling
 
+        if profit_loss < -self.stop_loss * current_price:
+            return False  # Stop trade
+
+        # Update balance and drawdown
+        self.balance += profit_loss
+        self.max_balance = max(self.balance, self.max_balance)
+        self.drawdown = (self.max_balance - self.balance) / self.max_balance
+        
+        if self.drawdown > self.max_drawdown:
+            return False  # Stop trading
+
+        return True  # Proceed with trade
+
+    def adjust_reward_for_trade(self, reward, action, current_price):
+        """Adjust the reward to account for transaction costs and slippage."""
+        if action in [0, 1]:  # Buy or Sell
+            cost = current_price * (self.transaction_cost + self.slippage)
+            if action == 0:  # Buy
+                reward -= cost
+            elif action == 1:  # Sell
+                reward -= cost
+        return reward
+
+    def act(self, state):
+        """Choose an action using the DQN agent."""
+        state = np.expand_dims(state, axis=0)
+        return self.dqn.forward(state)[0]
+
+    def remember(self, state, action, reward, next_state, done):
+        """Store experiences in the DQN agent's memory."""
+        # Adjust reward for costs before storing in memory
+        adjusted_reward = self.adjust_reward_for_trade(reward, action, state[0, 0])
+        self.dqn.memory.append(state, action, adjusted_reward, next_state, done)
+
+    def kelly_criterion_position(self, current_price, expected_return, volatility):
+        """Calculate position size based on Kelly Criterion."""
+        if volatility == 0:
+            return 0  # Avoid division by zero
+        return (expected_return / volatility**2) - (1 / volatility**2)
+        
     def _build_model(self):
         model = Sequential()
         model.add(Dense(64, input_shape=(1, self.state_size), activation="relu"))
@@ -449,21 +486,24 @@ print("A3C Action:", action_a3c)
 def backtest_with_rl(data, episodes=50, batch_size=32, initial_balance=10000):
     state_size = 3  # Example state size: [price change, SMA, portfolio balance]
     action_size = 3  # Actions: Buy, Sell, Hold
-    agent = RLTradingAgent(state_size, action_size)
+    agent = RLTradingAgent(state_size, action_size, initial_balance=initial_balance)
     
     for episode in range(episodes):
         balance = initial_balance
         positions = 0
-        state = np.array([0, 0, balance]).reshape(1, state_size)  # Initial state
+        state = np.array([0, 0, balance]).reshape(1, state_size)
         for t in range(len(data) - 1):
             action = agent.act(state)
             next_state = np.array([data[t+1] - data[t], np.mean(data[max(0, t-5):t]), balance]).reshape(1, state_size)
             
             if action == 0:  # Buy
-                positions += balance // data[t]
-                balance -= positions * data[t] * 1.01  # Transaction cost
+                buy_price_with_costs = data[t] * (1 + agent.transaction_cost + agent.slippage)
+                shares_to_buy = balance // buy_price_with_costs
+                positions += shares_to_buy
+                balance -= shares_to_buy * buy_price_with_costs
             elif action == 1:  # Sell
-                balance += positions * data[t] * 0.99  # Transaction cost
+                sell_price_with_costs = data[t] * (1 - agent.transaction_cost - agent.slippage)
+                balance += positions * sell_price_with_costs
                 positions = 0
             
             reward = (balance + positions * data[t+1]) - (balance + positions * data[t])
@@ -474,10 +514,12 @@ def backtest_with_rl(data, episodes=50, batch_size=32, initial_balance=10000):
             if len(agent.memory) > batch_size:
                 agent.replay(batch_size)
 
+            if not agent.evaluate_trade(data[t+1], data[t], action):
+                break  # Stop trading if conditions are met
+
         logging.info(f"Episode {episode + 1}/{episodes} - Final Balance: ${balance + positions * data[-1]:.2f}")
     
     return balance + positions * data[-1]
-
 
 # Sharpe Ratio Calculation
 def calculate_sharpe(balance_history, risk_free_rate=0.02):
