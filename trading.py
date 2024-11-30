@@ -6,9 +6,12 @@ from statsmodels.tsa.arima.model import ARIMA
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor
 from keras.models import Sequential
-from keras.layers import Dense, LSTM, Dropout
+from keras.layers import Dense, Dropout, Conv1D, Flatten
+from rl.agents.dqn import DQNAgent
+from rl.policy import EpsGreedyQPolicy
+from rl.memory import SequentialMemory
 from keras.callbacks import EarlyStopping
-from textblob import TextBlob
+from a3c import A3CAgent
 from textblob import TextBlob
 from transformers import pipeline
 import re
@@ -17,6 +20,10 @@ import plotly.graph_objects as go
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
 import yfinance as yf
+from keras.optimizers import Adam, AdamW, RMSprop
+from rl.agents.dqn import DQNAgent
+from rl.policy import EpsGreedyQPolicy
+from rl.memory import SequentialMemory
 
 # Logging for debugging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -132,11 +139,10 @@ class KellyCriterion:
             logging.error(f"Error in Kelly Criterion calculation: {e}")
             return None
 
-# Dynamic Model Selection and Forecasting
 class ForecastingModels:
     @staticmethod
     def dynamic_model_selection(data):
-        """Select the best model dynamically based on recent data performance."""
+        """Dynamically selects the best forecasting model based on recent performance."""
         models = {
             'ARIMA': ForecastingModels.arima_forecast,
             'LSTM': ForecastingModels.lstm_forecast,
@@ -145,19 +151,26 @@ class ForecastingModels:
         }
         errors = {}
         tscv = TimeSeriesSplit(n_splits=3)
-        
+
         for model_name, model_func in models.items():
             try:
                 error_list = []
                 for train_index, test_index in tscv.split(data):
                     train, test = data[train_index], data[test_index]
                     prediction = model_func(train)
-                    error_list.append(mean_squared_error(test, [prediction]*len(test)))
-                errors[model_name] = np.mean(error_list)
+                    if prediction is not None:
+                        error = mean_squared_error(test, [prediction] * len(test))
+                        error_list.append(error)
+                if error_list:
+                    errors[model_name] = np.mean(error_list)
             except Exception as e:
-                logging.error(f"Error in {model_name} evaluation: {e}")
-        
-        return min(errors, key=errors.get)
+                logging.error(f"Error evaluating {model_name}: {e}")
+
+        best_model = min(errors, key=errors.get, default=None)
+        if best_model is None:
+            raise ValueError("No valid model could be selected.")
+        logging.info(f"Selected best model: {best_model}")
+        return best_model
 
     @staticmethod
     def arima_forecast(data, order=(5, 1, 0)):
@@ -222,32 +235,37 @@ class ForecastingModels:
         return model.predict([[len(data)]])[0]
 
 
-# Modify LSTM to include online learning
-def online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1):
+def online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1, model=None):
     """Incremental learning for LSTM with online updates."""
     data = np.array(data)
     X, Y = [], []
+    
+    # Prepare data with a sliding window approach
     for i in range(len(data) - look_back):
         X.append(data[i:i + look_back])
         Y.append(data[i + look_back])
-
+    
     X, Y = np.array(X), np.array(Y)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-
-    model = Sequential()
-    model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
-    model.add(LSTM(50))
-    model.add(Dropout(0.2))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
-
-    # Update model incrementally
-    for i in range(epochs):
-        model.fit(X, Y, epochs=1, batch_size=batch_size, verbose=0)
-
+    X = np.reshape(X, (X.shape[0], X.shape[1], 1))  # Reshape for LSTM input
+    
+    # If no model is provided, initialize a new one
+    if model is None:
+        model = Sequential()
+        model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
+        model.add(LSTM(50))
+        model.add(Dropout(0.2))
+        model.add(Dense(1))
+        model.compile(optimizer=Adam(), loss='mean_squared_error')
+    
+    # Update the model incrementally
+    model.fit(X, Y, epochs=epochs, batch_size=batch_size, verbose=0)
+    
     # Predict for the next time step
     last_sequence = data[-look_back:].reshape(1, look_back, 1)
-    return model.predict(last_sequence)[0][0]
+    return model.predict(last_sequence)[0][0], model
+
+# Example of calling the function
+forecast, updated_model = online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1)
 
 from sklearn.ensemble import HistGradientBoostingRegressor
 
@@ -296,13 +314,6 @@ def ensemble_models(models, data):
     return meta_model.predict(np.array(predictions).T)
 
 
-def integrate_sentiment_into_state(state, sentiment_score):
-    """Extend the state space with sentiment score."""
-    return np.append(state, sentiment_score)
-
-# Example usage: 
-sentiment_score = SentimentAnalysis.get_sentiment(news_headline)
-state_with_sentiment = integrate_sentiment_into_state(state, sentiment_score)
 
 # Advanced Hyperparameter Tuning
 def advanced_hyperparameter_tuning(model, params, data):
@@ -313,7 +324,6 @@ def advanced_hyperparameter_tuning(model, params, data):
 
 class RLTradingAgent:
     def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000):
-        # Reinforcement learning parameters
         self.state_size = state_size
         self.action_size = action_size
         self.memory = deque(maxlen=2000)
@@ -339,44 +349,71 @@ class RLTradingAgent:
         elif optimizer == 'rmsprop':
             self.optimizer = RMSprop(learning_rate=self.learning_rate)
 
-        self.model = self._build_model()
+        # Initialize DQN
+        self.dqn = self._build_dqn_agent()
+        
+        # A3C is more complex and usually involves multiple workers
+        # Here, we'll just set up the model for A3C
+        self.a3c_model = self._build_a3c_model()
 
     def _build_model(self):
-        """Build the neural network model."""
         model = Sequential()
-        model.add(Dense(24, input_dim=self.state_size, activation='relu'))
-        model.add(Dense(24, activation='relu'))
-        model.add(Dense(self.action_size, activation='linear'))
-        model.compile(loss='mse', optimizer=self.optimizer)
+        model.add(Dense(64, input_shape=(1, self.state_size), activation="relu"))
+        model.add(Flatten())
+        model.add(Dense(64, activation="relu"))
+        model.add(Dense(self.action_size, activation="linear"))
+        model.compile(optimizer=self.optimizer, loss='mse')
         return model
 
-    def remember(self, state, action, reward, next_state, done):
-        """Store experiences in memory."""
-        self.memory.append((state, action, reward, next_state, done))
+    def _build_dqn_agent(self):
+        model = self._build_model()
+        memory = SequentialMemory(limit=50000, window_length=1)
+        policy = EpsGreedyQPolicy()
+        dqn = DQNAgent(model=model, nb_actions=self.action_size, memory=memory, 
+                       nb_steps_warmup=10, target_model_update=1e-2, policy=policy)
+        dqn.compile(Adam(lr=1e-3), metrics=['mae'])
+        return dqn
+
+    def _build_a3c_model(self):
+        # A3C typically uses a shared network for both actor and critic
+        # Here is a simple example; real A3C would involve more complex architecture
+        model = Sequential()
+        model.add(Dense(64, input_shape=(1, self.state_size), activation="relu"))
+        model.add(Flatten())
+        model.add(Dense(64, activation="relu"))
+        model.add(Dense(self.action_size, activation="linear"))
+        model.compile(optimizer=self.optimizer, loss='mse')  # Actor typically uses categorical cross-entropy
+        return model
 
     def act(self, state):
-        """Choose an action using an epsilon-greedy policy."""
-        if np.random.rand() <= self.epsilon:
-            return random.randrange(self.action_size)
-        q_values = self.model.predict(state, verbose=0)
-        return np.argmax(q_values[0])
+        """Choose an action using the DQN agent."""
+        state = np.expand_dims(state, axis=0)  # Add batch dimension
+        return self.dqn.forward(state)[0]
+
+    def act_a3c(self, state):
+        """Choose an action using the A3C model."""
+        state = np.expand_dims(state, axis=0)  # Add batch dimension
+        action_probabilities = self.a3c_model.predict(state)[0]
+        return np.random.choice(self.action_size, p=action_probabilities)
+
+    def remember(self, state, action, reward, next_state, done):
+        """Store experiences in the DQN agent's memory."""
+        self.dqn.memory.append(state, action, reward, next_state, done)
+
+    def remember_a3c(self, state, action, reward, next_state, done):
+        """For A3C, we directly update with each step, but for simplicity:
+        This method is a placeholder for how A3C would handle a single trajectory."""
+        pass  # A3C doesn't use a memory buffer in the same way
 
     def replay(self, batch_size):
-        """Train the model using a random batch from memory."""
-        minibatch = random.sample(self.memory, batch_size)
-        for state, action, reward, next_state, done in minibatch:
-            target = reward
-            if not done:
-                target += self.gamma * np.amax(self.model.predict(next_state, verbose=0)[0])
-            target_f = self.model.predict(state, verbose=0)
-            target_f[0][action] = target
-            self.model.fit(state, target_f, epochs=1, verbose=0)
+        """Train the DQN model."""
+        self.dqn.fit(batch_size=batch_size, nb_epochs=1, verbose=0)
 
-        if self.epsilon > self.epsilon_min:
-            self.epsilon *= self.epsilon_decay
+    def replay_a3c(self):
+        """A3C generally doesn't use replay; it updates online."""
+        pass  # Placeholder for A3C training logic
 
     def evaluate_trade(self, current_price, predicted_price):
-        """Evaluate the trade based on stop-loss and drawdown constraints."""
         # Calculate profit/loss
         profit_loss = current_price - predicted_price
         if profit_loss < -self.stop_loss * current_price:
@@ -394,6 +431,20 @@ class RLTradingAgent:
 
         return True  # Proceed with trade
 
+    def integrate_sentiment(self, state, sentiment_score):
+        """Integrate sentiment score into state."""
+        return np.append(state, sentiment_score)
+
+# Example usage for DQN:
+state = np.random.rand(1, 3)  # Example state
+agent = RLTradingAgent(state_size=3, action_size=2)
+action = agent.act(state)
+print("DQN Action:", action)
+
+# Example usage for A3C:
+action_a3c = agent.act_a3c(state)
+print("A3C Action:", action_a3c)
+ 
 # RL-enhanced Backtesting
 def backtest_with_rl(data, episodes=50, batch_size=32, initial_balance=10000):
     state_size = 3  # Example state size: [price change, SMA, portfolio balance]
