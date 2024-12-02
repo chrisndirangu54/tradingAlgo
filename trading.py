@@ -1,6 +1,9 @@
 import numpy as np
 import pandas as pd
-import yfinance as yf
+from keras.layers import LSTM
+from collections import deque
+from sklearn.model_selection import RandomizedSearchCV
+import optuna
 from scipy.stats import norm
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.svm import SVR
@@ -25,249 +28,6 @@ from rl.agents.dqn import DQNAgent
 from rl.policy import EpsGreedyQPolicy
 from rl.memory import SequentialMemory
 
-# Logging for debugging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# Define the model and parameter grid
-model = RandomForestRegressor()
-param_grid = {
-    'n_estimators': np.arange(50, 201, 50),
-    'max_depth': np.arange(5, 21),
-    'min_samples_split': np.arange(2, 11),
-}
-
-# Perform RandomizedSearchCV
-random_search = RandomizedSearchCV(model, param_grid, n_iter=100, cv=5, random_state=42, verbose=2)
-random_search.fit(X_train, y_train)
-
-best_params = random_search.best_params_
-print("Best parameters found: ", best_params)
-
-def objective(trial):
-    n_estimators = trial.suggest_int('n_estimators', 50, 200, step=50)
-    max_depth = trial.suggest_int('max_depth', 5, 20)
-    min_samples_split = trial.suggest_int('min_samples_split', 2, 10)
-    
-    model = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, min_samples_split=min_samples_split)
-    model.fit(X_train, y_train)
-    
-    score = model.score(X_test, y_test)  # or use cross-validation scores
-    return score
-
-study = optuna.create_study(direction='maximize')
-study.optimize(objective, n_trials=100)
-best_params = study.best_params
-print(f"Best Parameters: {best_params}")
-
-# Fetch live data for a stock (e.g., Apple)
-stock_data = yf.download('AAPL', period="1d", interval="1m")  # 1-minute interval data
-
-# Use the real-time data in your forecasting model
-X_live = stock_data[['Open', 'High', 'Low', 'Close', 'Volume']]  # Relevant features
-y_live = stock_data['Close']  # Predict next closing price
-
-# Make predictions with your trained model
-predictions = model.predict(X_live)
-
-
-# Sentiment Analysis Module
-class SentimentAnalysis:
-    # Initialize a transformer-based sentiment analysis pipeline
-    sentiment_pipeline = pipeline("sentiment-analysis")
-
-    @staticmethod
-    def preprocess_text(text):
-        """Clean and preprocess text by removing noise like URLs, special characters, etc."""
-        text = re.sub(r'http\S+', '', text)  # Remove URLs
-        text = re.sub(r'[^A-Za-z0-9\s]', '', text)  # Remove special characters
-        text = text.lower().strip()  # Convert to lowercase and strip whitespace
-        return text
-
-    @staticmethod
-    def get_sentiment_blob(text):
-        """Sentiment analysis using TextBlob (Polarity: -1 to 1)."""
-        return TextBlob(text).sentiment.polarity
-
-    @staticmethod
-    def get_sentiment_transformer(text):
-        """Sentiment analysis using a transformer-based model."""
-        try:
-            result = SentimentAnalysis.sentiment_pipeline(text)[0]
-            sentiment = result['label']
-            score = result['score']
-            return sentiment, score
-        except Exception as e:
-            logging.error(f"Error in transformer-based sentiment analysis: {e}")
-            return None, 0
-
-    @staticmethod
-    def analyze(text):
-        """Preprocess and analyze sentiment using both TextBlob and transformers."""
-        text = SentimentAnalysis.preprocess_text(text)
-        polarity = SentimentAnalysis.get_sentiment_blob(text)
-        transformer_sentiment, transformer_score = SentimentAnalysis.get_sentiment_transformer(text)
-        return {
-            "polarity": polarity,
-            "transformer_sentiment": transformer_sentiment,
-            "transformer_score": transformer_score,
-        }
-
-
-# Option Pricing Module
-class BlackScholes:
-    @staticmethod
-    def calculate(S, K, T, r, sigma, option_type="call"):
-        try:
-            d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-            d2 = d1 - sigma * np.sqrt(T)
-            if option_type == "call":
-                return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
-            elif option_type == "put":
-                return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
-        except Exception as e:
-            logging.error(f"Error in Black-Scholes calculation: {e}")
-            return None
-
-# Kelly Criterion Simulation
-class KellyCriterion:
-    @staticmethod
-    def calculate(prob_win, odds):
-        """Calculates the optimal bet fraction using the Kelly Criterion."""
-        try:
-            return max(0, (prob_win * (odds + 1) - 1) / odds)
-        except Exception as e:
-            logging.error(f"Error in Kelly Criterion calculation: {e}")
-            return None
-
-class ForecastingModels:
-    @staticmethod
-    def dynamic_model_selection(data):
-        """Dynamically selects the best forecasting model based on recent performance."""
-        models = {
-            'ARIMA': ForecastingModels.arima_forecast,
-            'LSTM': ForecastingModels.lstm_forecast,
-            'SVM': ForecastingModels.svm_forecast,
-            'RandomForest': ForecastingModels.random_forest_forecast
-        }
-        errors = {}
-        tscv = TimeSeriesSplit(n_splits=3)
-
-        for model_name, model_func in models.items():
-            try:
-                error_list = []
-                for train_index, test_index in tscv.split(data):
-                    train, test = data[train_index], data[test_index]
-                    prediction = model_func(train)
-                    if prediction is not None:
-                        error = mean_squared_error(test, [prediction] * len(test))
-                        error_list.append(error)
-                if error_list:
-                    errors[model_name] = np.mean(error_list)
-            except Exception as e:
-                logging.error(f"Error evaluating {model_name}: {e}")
-
-        best_model = min(errors, key=errors.get, default=None)
-        if best_model is None:
-            raise ValueError("No valid model could be selected.")
-        logging.info(f"Selected best model: {best_model}")
-        return best_model
-
-    @staticmethod
-    def arima_forecast(data, order=(5, 1, 0)):
-        try:
-            model = ARIMA(data, order=order)
-            model_fit = model.fit()
-            return model_fit.forecast(steps=1)[0]
-        except Exception as e:
-            logging.error(f"Error in ARIMA forecast: {e}")
-            return None
-
-    @staticmethod
-    # Modify LSTM to include online learning
-    def lstm_forecast(data, look_back=10, epochs=1, batch_size=1):
-        """Incremental learning for LSTM with online updates."""
-        data = np.array(data)
-        X, Y = [], []
-        for i in range(len(data) - look_back):
-            X.append(data[i:i + look_back])
-            Y.append(data[i + look_back])
-    
-        X, Y = np.array(X), np.array(Y)
-        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-    
-        model = Sequential()
-        model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
-        model.add(LSTM(50))
-        model.add(Dropout(0.2))
-        model.add(Dense(1))
-        model.compile(optimizer='adam', loss='mean_squared_error')
-    
-        # Update model incrementally
-        for i in range(epochs):
-            model.fit(X, Y, epochs=1, batch_size=batch_size, verbose=0)
-    
-        # Predict for the next time step
-        last_sequence = data[-look_back:].reshape(1, look_back, 1)
-        return model.predict(last_sequence)[0][0]
-
-    @staticmethod
-    def svm_forecast(data):
-        try:
-            X = np.arange(len(data)).reshape(-1, 1)
-            Y = np.array(data)
-            model = SVR(kernel='rbf', C=100, gamma=0.1, epsilon=0.1)
-            model.fit(X, Y)
-            return model.predict([[len(data)]])[0]
-        except Exception as e:
-            logging.error(f"Error in SVM forecast: {e}")
-            return None
-
-    @staticmethod
-    def random_forest_forecast(data):
-        """Use HistGradientBoosting for online learning (tree-based)."""
-        X = np.arange(len(data)).reshape(-1, 1)
-        Y = np.array(data)
-        
-        model = HistGradientBoostingRegressor(max_iter=1, warm_start=True)
-        model.fit(X, Y)  # Train on available data
-        
-        # Predict for the next time step
-        return model.predict([[len(data)]])[0]
-
-
-def online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1, model=None):
-    """Incremental learning for LSTM with online updates."""
-    data = np.array(data)
-    X, Y = [], []
-    
-    # Prepare data with a sliding window approach
-    for i in range(len(data) - look_back):
-        X.append(data[i:i + look_back])
-        Y.append(data[i + look_back])
-    
-    X, Y = np.array(X), np.array(Y)
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))  # Reshape for LSTM input
-    
-    # If no model is provided, initialize a new one
-    if model is None:
-        model = Sequential()
-        model.add(LSTM(50, return_sequences=True, input_shape=(look_back, 1)))
-        model.add(LSTM(50))
-        model.add(Dropout(0.2))
-        model.add(Dense(1))
-        model.compile(optimizer=Adam(), loss='mean_squared_error')
-    
-    # Update the model incrementally
-    model.fit(X, Y, epochs=epochs, batch_size=batch_size, verbose=0)
-    
-    # Predict for the next time step
-    last_sequence = data[-look_back:].reshape(1, look_back, 1)
-    return model.predict(last_sequence)[0][0], model
-
-# Example of calling the function
-forecast, updated_model = online_lstm_forecast(data, look_back=10, epochs=1, batch_size=1)
-
-from sklearn.ensemble import HistGradientBoostingRegressor
 
 def online_random_forest_forecast(data):
     """Use HistGradientBoosting for online learning (tree-based)."""
@@ -295,19 +55,8 @@ def feature_importance_based_feature_engineering(data):
 
     return moving_avg
 
-def manage_overnight_risk(self):
-    if self.positions > 0:
-        self.positions = 0  # Sell all positions
-        # Adjust balance for closing these positions including costs
 
-def adjust_reward_for_risk(reward, position_size, volatility, risk_threshold=0.05):
-    """Adjust the reward by penalizing high risk positions."""
-    if volatility > risk_threshold:
-        reward -= 0.1 * position_size  # Penalize large positions during high volatility
-    return reward
 
-# Example usage in the RL agent:
-reward = adjust_reward_for_risk(reward, position_size, current_volatility)
 
 from sklearn.linear_model import LogisticRegression
 
@@ -331,68 +80,41 @@ def advanced_hyperparameter_tuning(model, params, data):
     return grid_search.best_params_
 
 class RLTradingAgent:
-    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000,
-                 transaction_cost=0.001, slippage=0.0005):  # 0.1% transaction fee, 0.05% slippage
+    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000, transaction_cost=0.001, slippage=0.001):
         self.state_size = state_size
         self.action_size = action_size
-        # ... (other initializations)
-        self.transaction_cost = transaction_cost  # Transaction cost rate
-        self.slippage = slippage  # Slippage rate
+        self.memory = deque(maxlen=2000)
+        self.initial_balance = initial_balance
+        self.balance = initial_balance
+        self.max_balance = initial_balance
+        self.drawdown = 0
+        self.stop_loss = stop_loss
+        self.max_drawdown = max_drawdown
+        self.transaction_cost = transaction_cost
+        self.slippage = slippage
+        self._set_optimizer(optimizer)
+        self.gamma = 0.95
+        self.epsilon = 1.0
+        self.epsilon_decay = 0.995
+        self.epsilon_min = 0.01
+        self.positions = 0  # or whatever the initial value should be
+    
+    def _set_optimizer(self, optimizer):
+        if optimizer == 'adam':
+            self.optimizer = Adam(learning_rate=self.learning_rate)
+        elif optimizer == 'adamw':
+            self.optimizer = AdamW(learning_rate=self.learning_rate)
+        elif optimizer == 'rmsprop':
+            self.optimizer = RMSprop(learning_rate=self.learning_rate)
 
-    def evaluate_trade(self, current_price, predicted_price, action):
-        profit_loss = current_price - predicted_price
-        
-        # Apply transaction costs and slippage
-        if action in [0, 1]:  # Buy or Sell
-            transaction_fee = current_price * self.transaction_cost
-            slippage_cost = current_price * self.slippage
-            total_cost = transaction_fee + slippage_cost
-        
-        if action == 0:  # Buy
-            self.balance -= total_cost  # Deduct costs when buying
-        elif action == 1:  # Sell
-            profit_loss -= total_cost  # Deduct costs from profit when selling
 
-        if profit_loss < -self.stop_loss * current_price:
-            return False  # Stop trade
-
-        # Update balance and drawdown
-        self.balance += profit_loss
-        self.max_balance = max(self.balance, self.max_balance)
-        self.drawdown = (self.max_balance - self.balance) / self.max_balance
-        
-        if self.drawdown > self.max_drawdown:
-            return False  # Stop trading
-
-        return True  # Proceed with trade
-
-    def adjust_reward_for_trade(self, reward, action, current_price):
-        """Adjust the reward to account for transaction costs and slippage."""
-        if action in [0, 1]:  # Buy or Sell
-            cost = current_price * (self.transaction_cost + self.slippage)
-            if action == 0:  # Buy
-                reward -= cost
-            elif action == 1:  # Sell
-                reward -= cost
-        return reward
-
-    def act(self, state):
-        """Choose an action using the DQN agent."""
-        state = np.expand_dims(state, axis=0)
-        return self.dqn.forward(state)[0]
-
-    def remember(self, state, action, reward, next_state, done):
-        """Store experiences in the DQN agent's memory."""
-        # Adjust reward for costs before storing in memory
-        adjusted_reward = self.adjust_reward_for_trade(reward, action, state[0, 0])
-        self.dqn.memory.append(state, action, adjusted_reward, next_state, done)
-
-    def kelly_criterion_position(self, current_price, expected_return, volatility):
-        """Calculate position size based on Kelly Criterion."""
-        if volatility == 0:
-            return 0  # Avoid division by zero
-        return (expected_return / volatility**2) - (1 / volatility**2)
-        
+    # Initialize DQN
+    self.dqn = self._build_dqn_agent()
+    
+    # A3C is more complex and usually involves multiple workers
+    # Here, we'll just set up the model for A3C
+    self.a3c_model = self._build_a3c_model()
+       
     def _build_model(self):
         model = Sequential()
         model.add(Dense(64, input_shape=(1, self.state_size), activation="relu"))
@@ -468,6 +190,28 @@ class RLTradingAgent:
 
         return True  # Proceed with trade
 
+def manage_overnight_risk(self, current_price, forecasted_price):
+    """Manage overnight positions to mitigate risk."""
+    if self.positions > 0:  # If we have open positions
+    price_difference = current_price - forecasted_price
+    if price_difference > self.stop_loss * current_price:
+    # Close position if the difference is beyond our stop loss threshold
+    self.positions = 0
+    self.balance -= self.positions * current_price  # Adjust balance for closing positions
+    logging.info("Overnight risk management: Position closed due to price drop.")
+    else:
+    logging.info("Overnight risk assessed, no action taken.")
+            
+def adjust_reward_for_risk(reward, position_size, volatility, risk_threshold=0.05):
+    """Adjust the reward by penalizing high risk positions."""
+    if volatility > risk_threshold:
+        reward -= 0.1 * position_size  # Penalize large positions during high volatility
+    return reward
+
+# Example usage in the RL agent:
+reward = adjust_reward_for_risk(reward, position_size, current_volatility)
+
+
     def integrate_sentiment(self, state, sentiment_score):
         """Integrate sentiment score into state."""
         return np.append(state, sentiment_score)
@@ -486,40 +230,208 @@ print("A3C Action:", action_a3c)
 def backtest_with_rl(data, episodes=50, batch_size=32, initial_balance=10000):
     state_size = 3  # Example state size: [price change, SMA, portfolio balance]
     action_size = 3  # Actions: Buy, Sell, Hold
-    agent = RLTradingAgent(state_size, action_size, initial_balance=initial_balance)
+    agent = RLTradingAgent(state_size=state_size, action_size=action_size, initial_balance=initial_balance)
     
+    all_balances = []
+
     for episode in range(episodes):
         balance = initial_balance
         positions = 0
         state = np.array([0, 0, balance]).reshape(1, state_size)
+        episode_balances = [balance]  # Keep track of balance throughout the episode
+
         for t in range(len(data) - 1):
-            action = agent.act(state)
-            next_state = np.array([data[t+1] - data[t], np.mean(data[max(0, t-5):t]), balance]).reshape(1, state_size)
+            # Predict price movement or volatility if needed
+            # Here, we're using a very simple prediction, you might replace this with a more complex model
             
+            price_change = data[t+1] - data[t]
+            mean_price = np.mean(data[max(0, t-5):t])
+            
+            # Integrate sentiment if available from external sources or as part of state
+            state = np.array([price_change, mean_price, balance]).reshape(1, state_size)
+
+            # Choose action based on the current state
+            action = agent.act(state)
+
+            # Apply action
             if action == 0:  # Buy
                 buy_price_with_costs = data[t] * (1 + agent.transaction_cost + agent.slippage)
-                shares_to_buy = balance // buy_price_with_costs
-                positions += shares_to_buy
-                balance -= shares_to_buy * buy_price_with_costs
+                shares_to_buy = int(balance // buy_price_with_costs)  # Ensure integer shares
+                if shares_to_buy > 0:
+                    positions += shares_to_buy
+                    balance -= shares_to_buy * buy_price_with_costs
             elif action == 1:  # Sell
-                sell_price_with_costs = data[t] * (1 - agent.transaction_cost - agent.slippage)
-                balance += positions * sell_price_with_costs
-                positions = 0
+                if positions > 0:
+                    sell_price_with_costs = data[t] * (1 - agent.transaction_cost - agent.slippage)
+                    balance += positions * sell_price_with_costs
+                    positions = 0
             
-            reward = (balance + positions * data[t+1]) - (balance + positions * data[t])
+            # Update state for next iteration
+            balance_with_positions = balance + positions * data[t+1]
+            next_state = np.array([data[t+1] - data[t], mean_price, balance_with_positions]).reshape(1, state_size)
+            
+            # Calculate reward
+            reward = balance_with_positions - (balance + positions * data[t])
+            reward = agent.adjust_reward_for_risk(reward, positions, np.std(data[max(0, t-20):t+1]))
+            
             done = t == (len(data) - 2)
             agent.remember(state, action, reward, next_state, done)
             state = next_state
 
+            # Update balance history
+            episode_balances.append(balance_with_positions)
+
+            # Check for risk management conditions
+            if not agent.evaluate_trade(data[t+1], data[t], action):
+                print("Trading stopped due to risk management rules.")
+                break
+
             if len(agent.memory) > batch_size:
                 agent.replay(batch_size)
 
-            if not agent.evaluate_trade(data[t+1], data[t], action):
-                break  # Stop trading if conditions are met
+            # Adjust stop-loss based on recent volatility
+            if t > 20:  # Need enough data to calculate volatility
+                agent.adjust_stop_loss(np.std(data[max(0, t-20):t+1]))
 
-        logging.info(f"Episode {episode + 1}/{episodes} - Final Balance: ${balance + positions * data[-1]:.2f}")
+        # Manage overnight risk at the end of each trading day or episode
+        agent.manage_overnight_risk()
+
+        # Log episode results
+        all_balances.append(episode_balances)
+        logging.info(f"Episode {episode + 1}/{episodes} - Final Balance: ${balance_with_positions:.2f}, Max Drawdown: {max(0, (max(episode_balances) - balance_with_positions) / max(episode_balances)):.2%}")
+
+    return all_balances, balance_with_positions  # Return all balances for further analysis
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+
+def generate_weighted_trade_signal(historical_data, sentiment_score=None, weights=None):
+    """
+    Generate a trade signal using weighted combination of indicators.
+
+    :param historical_data: Historical price data up to current time
+    :param sentiment_score: Sentiment score from sentiment analysis
+    :param weights: Dictionary specifying weights for different signals
+    :return: 'buy', 'sell', or 'hold'
+    """
+    if len(historical_data) < 30:
+        return 'hold'
     
-    return balance + positions * data[-1]
+    close = pd.Series(historical_data, name='close')
+    
+    # Calculate indicators
+    rsi = RSIIndicator(close, window=14).rsi()
+    macd = MACD(close).macd()
+    bb = BollingerBands(close, window=20, window_dev=2)
+    
+    current_price = close[-1]
+    ma5 = np.mean(close[-5:])
+    
+    # Define default weights if not provided
+    if weights is None:
+        weights = {
+            'price_trend': 0.3,
+            'technical': 0.5,
+            'sentiment': 0.2
+        }
+    
+    # Compute signals
+    signals = {
+        'price_trend': 0,
+        'technical': 0,
+        'sentiment': 0
+    }
+    
+    # Price Trend Signal
+    if current_price > ma5 and all(close.iloc[-i] <= close.iloc[-i+1] for i in range(1, 4)):
+        signals['price_trend'] = 1
+    elif current_price < ma5 and all(close.iloc[-i] >= close.iloc[-i+1] for i in range(1, 4)) or current_price / close[-2] < 0.98:
+        signals['price_trend'] = -1
+    
+    # Technical Indicators Signal
+    if rsi[-1] < 30 and macd[-1] > macd[-2]:
+        signals['technical'] = 1
+    elif rsi[-1] > 70 and macd[-1] < macd[-2]:
+        signals['technical'] = -1
+    elif current_price < bb.bollinger_lband()[-1]:
+        signals['technical'] = 1
+    
+    # Sentiment Signal
+    if sentiment_score is not None:
+        if sentiment_score > 0.7:
+            signals['sentiment'] = 1
+        elif sentiment_score < -0.3:
+            signals['sentiment'] = -1
+    
+    # Combine signals with weights
+    weighted_sum = sum(signals[signal] * weights[signal] for signal in weights.keys())
+    
+    if weighted_sum > 0.3:  # Threshold for buying
+        return 'buy'
+    elif weighted_sum < -0.3:  # Threshold for selling
+        return 'sell'
+    else:
+        return 'hold'
+
+# Example usage:
+# signal = generate_weighted_trade_signal(historical_data, sentiment_score)
+
+def train_and_use_rf_model(historical_data, labels, test_data, sentiment_score=None):
+    """
+    Train a Random Forest model on historical data and use it to predict trading signals for new data.
+
+    :param historical_data: Historical features data with known outcomes
+    :param labels: Labels corresponding to buy/sell/hold from historical data
+    :param test_data: Features data for which to generate signals
+    :param sentiment_score: Sentiment score for new data
+    :return: Predicted signal
+    """
+    # Prepare features
+    features = ['rsi', 'macd', 'bb_distance', 'price_trend', 'sentiment']
+    X = prepare_data_for_rf(historical_data, labels, features)
+    y = labels
+    
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Train model
+    rf_model = RandomForestClassifier()
+    rf_model.fit(X_train, y_train)
+    
+    # Predict on test data
+    new_features = prepare_data_for_rf([test_data], [sentiment_score], features)
+    prediction = rf_model.predict(new_features)
+    
+    return prediction[0]  # Assuming a single prediction
+
+def prepare_data_for_rf(data, sentiment_scores, features):
+    """
+    Prepare features for Random Forest model.
+
+    :param data: Price data
+    :param sentiment_scores: Sentiment scores for each data point
+    :param features: List of features to prepare
+    :return: DataFrame with features
+    """
+    close = pd.Series(data)
+    rsi = RSIIndicator(close, window=14).rsi()
+    macd = MACD(close).macd()
+    bb = BollingerBands(close, window=20, window_dev=2)
+    
+    X = pd.DataFrame({
+        'rsi': rsi,
+        'macd': macd,
+        'bb_distance': (close - bb.bollinger_mavg()) / bb.bollinger_hband(),
+        'price_trend': np.sign(close.diff().rolling(window=3).mean()),
+        'sentiment': sentiment_scores
+    })
+    
+    return X[features].fillna(0)
+
+# Example usage:
+# historical_data_with_labels = ...  # This should include past decisions and outcomes
+# new_data = ...  # Your current market data
+# sentiment_score = ...  # Current sentiment score
+# signal = train_and_use_rf_model(historical_data_with_labels, new_data, sentiment_score)
 
 # Sharpe Ratio Calculation
 def calculate_sharpe(balance_history, risk_free_rate=0.02):
@@ -549,7 +461,6 @@ def monte_carlo_simulation(current_price, n_simulations=1000, n_days=252, volati
 
 # Main Workflow
 if __name__ == "__main__":
-    # Fetch Historical Data
     ticker = "AAPL"
     try:
         data = yf.download(ticker, interval="1d", period="1y")['Close']
@@ -559,7 +470,8 @@ if __name__ == "__main__":
 
     # Sentiment Analysis
     news_headline = "Apple announces record-breaking earnings this quarter."
-    sentiment_score = SentimentAnalysis.get_sentiment(news_headline)
+    sentiment_result = SentimentAnalysis.analyze(news_headline)
+    sentiment_score = sentiment_result['polarity']  # or transformer_score if preferred
 
     # Monte Carlo Simulation
     current_price = data.values[-1]
@@ -578,7 +490,16 @@ if __name__ == "__main__":
     logging.info(f"Best model selected: {best_model}")
 
     # Backtesting with Metrics
-    final_balance, balance_history = backtest_strategy(data.values, generate_trade_signal)
+    # Assuming we have historical labels for training the RF model
+    labels = np.random.choice(['buy', 'sell', 'hold'], size=len(data))  # Placeholder, should use real data
+    signal = train_and_use_rf_model(data.values, labels, data.values[-1], sentiment_score)
+    final_balance, balance_history = backtest_with_rl(data.values)  # Changed to use RL backtesting
+    
     sharpe_ratio = calculate_sharpe(balance_history)
     print(f"Final Balance: ${final_balance:.2f}")
     print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
+
+    # RL Backtesting
+    all_balances, final_rl_balance = backtest_with_rl(data.values)
+    print(f"RL Final Balance: ${final_rl_balance:.2f}")
+    print(f"RL Sharpe Ratio: {calculate_sharpe(all_balances[-1])}")
