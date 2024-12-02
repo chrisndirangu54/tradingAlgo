@@ -80,7 +80,10 @@ def advanced_hyperparameter_tuning(model, params, data):
     return grid_search.best_params_
 
 class RLTradingAgent:
-    def __init__(self, state_size, action_size, optimizer='adam', stop_loss=0.05, max_drawdown=0.2, initial_balance=100000, transaction_cost=0.001, slippage=0.001):
+    def __init__((self, state_size, action_size, optimizer='adam', stop_loss=0.05, 
+                 max_drawdown=0.2, initial_balance=100000, transaction_cost=0.001, 
+                 slippage=0.001, learning_rate=0.001, gamma=0.95, epsilon_decay=0.995
+):
         self.state_size = state_size
         self.action_size = action_size
         self.memory = deque(maxlen=2000)
@@ -95,9 +98,12 @@ class RLTradingAgent:
         self._set_optimizer(optimizer)
         self.gamma = 0.95
         self.epsilon = 1.0
-        self.epsilon_decay = 0.995
+        self.epsilon_decay = epsilon_decay
         self.epsilon_min = 0.01
         self.positions = 0  # or whatever the initial value should be
+        self.learning_rate = learning_rate
+        self.volatility_model = GARCH(p=1, q=1)  # Example: use a GARCH model for volatility
+
     
     def _set_optimizer(self, optimizer):
         if optimizer == 'adam':
@@ -134,20 +140,59 @@ class RLTradingAgent:
         return dqn
 
     def _build_a3c_model(self):
-        # A3C typically uses a shared network for both actor and critic
-        # Here is a simple example; real A3C would involve more complex architecture
-        model = Sequential()
-        model.add(Dense(64, input_shape=(1, self.state_size), activation="relu"))
-        model.add(Flatten())
-        model.add(Dense(64, activation="relu"))
-        model.add(Dense(self.action_size, activation="linear"))
-        model.compile(optimizer=self.optimizer, loss='mse')  # Actor typically uses categorical cross-entropy
+        # A3C model with shared layers for both actor and critic
+        input_state = Input(shape=(self.state_size,))
+        
+        # Shared layers
+        shared = Dense(64, activation="relu")(input_state)
+        shared = Dense(64, activation="relu")(shared)
+        
+        # Actor (Policy) Output
+        policy = Dense(self.action_size, activation="softmax")(shared)  # For discrete action space
+        
+        # Critic (Value) Output
+        value = Dense(1)(shared)  # Linear activation for value function
+        
+        # Combine into a model
+        model = Model(inputs=input_state, outputs=[policy, value])
+        
+        # Different losses for actor and critic
+        def combined_loss(y_true, y_pred):
+            # Assuming y_true is [action, _]
+            action_taken, value_target = y_true[:, :self.action_size], y_true[:, self.action_size:]
+            
+            # Policy loss (actor)
+            policy_loss = K.mean(-K.log(K.clip(K.sum(policy * K.one_hot(K.cast(K.flatten(action_taken), 'int32'), self.action_size), axis=-1), K.epsilon(), 1.0)))
+            
+            # Value loss (critic)
+            value_loss = K.mean(K.square(value_target - value))
+            
+            return policy_loss + value_loss
+    
+        model.compile(optimizer=self.optimizer, loss=combined_loss)
         return model
 
+    def _build_incremental_model(self):
+        # A model capable of incremental learning
+        from skmultiflow.trees import HoeffdingTreeRegressor
+        return HoeffdingTreeRegressor()
+
+    def learn_online(self, X, y):
+        self.incremental_model.learn_one(X, y)
+        # Update your DQN or policy network with the latest predictions from the incremental model
+
     def act(self, state):
-        """Choose an action using the DQN agent."""
-        state = np.expand_dims(state, axis=0)  # Add batch dimension
-        return self.dqn.forward(state)[0]
+        # Use the incrementally updated model for state prediction or feature extraction before decision
+        prediction = self.incremental_model.predict_one(state)
+        # Now use this prediction in your DQN decision process
+        return self.dqn.forward([prediction])[0]
+
+    def update_policy(self, state, action, reward, next_state, done):
+        # Here you would update your DQN or A3C model with the new experience,
+        # but with less emphasis on retraining everything from scratch
+        self.remember(state, action, reward, next_state, done)
+        self.replay(batch_size=32)  # or whatever your batch size is
+
 
     def act_a3c(self, state):
         """Choose an action using the A3C model."""
@@ -172,10 +217,38 @@ class RLTradingAgent:
         """A3C generally doesn't use replay; it updates online."""
         pass  # Placeholder for A3C training logic
 
-    def evaluate_trade(self, current_price, predicted_price):
-        # Calculate profit/loss
-        profit_loss = current_price - predicted_price
-        if profit_loss < -self.stop_loss * current_price:
+    def evaluate_trade(self, current_price, predicted_price, action, is_option=False, option_type=None):
+        """
+        Evaluate the trade outcome based on the current price and predicted price.
+        This method can handle both stock and option trades.
+
+        :param current_price: Current market price or stock price
+        :param predicted_price: Predicted price from the model or target price for options
+        :param action: 0 for buy/long, 1 for sell/short, 2 for hold
+        :param is_option: Boolean to indicate if the trade involves options
+        :param option_type: 'call' or 'put' for options, None for stocks
+        :return: Boolean indicating whether the trade should proceed
+        """
+        if action == 2:  # Hold
+            return True  # No change in balance for hold
+
+        if is_option and option_type:
+            # Calculate option value using Black-Scholes model
+            time_to_expiry = 1  # Example, you'd want to set this dynamically
+            option_value = self.black_scholes(current_price, predicted_price, time_to_expiry, self.risk_free_rate, self.volatility, option_type)
+            
+            if action == 0:  # Buy a call or put option
+                profit_loss = option_value
+            elif action == 1:  # Sell a call or put option
+                profit_loss = -option_value  # Selling an option involves receiving the premium
+        else:  # Handling stock trades
+            profit_loss = predicted_price - current_price if action == 0 else current_price - predicted_price
+            profit_loss *= self.positions  # Multiply by number of shares or contracts
+
+        # Apply transaction costs and slippage
+        profit_loss -= profit_loss * (self.transaction_cost + self.slippage)
+
+        if profit_loss < -self.stop_loss * (current_price * self.positions):  # For options, this might be adjusted based on option value
             print("Stop-loss triggered!")
             return False  # Stop trade
 
@@ -189,6 +262,56 @@ class RLTradingAgent:
             return False  # Stop trading
 
         return True  # Proceed with trade
+    def update_volatility(self, price_data):
+        self.volatility = self.volatility_model.fit_predict(price_data)
+
+    def black_scholes(self, stock_price, strike_price, time_to_expiry, risk_free_rate, volatility, option_type='call'):
+        """
+        Calculate the price of a European option using the Black-Scholes model.
+        """
+        # Update volatility before pricing
+        self.update_volatility(current_price_history)
+        # Now use this updated volatility in Black-Scholes calculation
+        d1 = (np.log(stock_price / strike_price) + (risk_free_rate + 0.5 * volatility ** 2) * time_to_expiry) / (volatility * np.sqrt(time_to_expiry))
+        d2 = d1 - volatility * np.sqrt(time_to_expiry)
+        
+        if option_type == 'call':
+            return (stock_price * norm.cdf(d1, 0.0, 1.0) - strike_price * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(d2, 0.0, 1.0))
+        elif option_type == 'put':
+            return (strike_price * np.exp(-risk_free_rate * time_to_expiry) * norm.cdf(-d2, 0.0, 1.0) - stock_price * norm.cdf(-d1, 0.0, 1.0))
+        else:
+            raise ValueError("Option type must be 'call' or 'put'")
+
+    def kelly_bet_fraction(self, win_prob, win_ratio):
+        """
+        Calculate the Kelly bet fraction.
+        """
+        return (win_prob * (win_ratio + 1) - 1) / win_ratio
+
+    def determine_position_size(self, current_price, predicted_price, action):
+        """
+        Determine the position size using Kelly Criterion.
+        """
+        if action == 0:  # Buy or Long Option
+            win_prob = self.estimate_win_probability(current_price, predicted_price)
+            win_ratio = (predicted_price / current_price) - 1
+        elif action == 1:  # Sell or Short Option
+            win_prob = self.estimate_win_probability(predicted_price, current_price)  # Probability of price falling below prediction
+            win_ratio = ((current_price - predicted_price) / current_price)
+
+        fraction = self.kelly_bet_fraction(win_prob, win_ratio)
+        # Adjust for practical considerations (like not betting full Kelly due to risk aversion)
+        position_size = self.balance * (fraction * 0.5)  # Betting half Kelly for safety
+        return position_size
+
+    def estimate_win_probability(self, current_price, predicted_price):
+        # Placeholder for model prediction accuracy or some other metric
+        # This could be based on historical accuracy or real-time model confidence
+        # For simplicity, we'll use the difference between current and predicted price
+        price_diff = abs(predicted_price - current_price)
+        # Assuming a normal distribution with mean at current price and volatility as standard deviation
+        prob = norm.cdf(current_price, loc=current_price, scale=self.volatility * current_price)
+        return prob
 
 def manage_overnight_risk(self, current_price, forecasted_price):
     """Manage overnight positions to mitigate risk."""
@@ -500,6 +623,26 @@ if __name__ == "__main__":
     print(f"Sharpe Ratio: {sharpe_ratio:.2f}")
 
     # RL Backtesting
-    all_balances, final_rl_balance = backtest_with_rl(data.values)
-    print(f"RL Final Balance: ${final_rl_balance:.2f}")
-    print(f"RL Sharpe Ratio: {calculate_sharpe(all_balances[-1])}")
+    study = optuna.create_study(direction='maximize')
+    study.optimize(lambda trial: objective(trial, data.values), n_trials=100)
+
+    print("Best hyperparameters:", study.best_params)
+    print("Best final balance:", -study.best_value)  # Convert back to positive
+
+    # Now use these best parameters for your agent
+    best_params = study.best_params
+    best_agent = RLTradingAgent(
+        state_size=3, 
+        action_size=3, 
+        initial_balance=initial_balance,
+        learning_rate=best_params['learning_rate'],
+        gamma=best_params['gamma'],
+        epsilon_decay=best_params['epsilon_decay']
+    )
+
+    # Run backtest with the best parameters
+    _, final_best_balance = backtest_with_rl(data.values, episodes=100, batch_size=best_params['batch_size'])
+    
+    print(f"Best Strategy Final Balance: ${final_best_balance:.2f}")
+    print(f"Best Strategy Sharpe Ratio: {calculate_sharpe(final_best_balance)}")
+
