@@ -9,10 +9,14 @@ from torch_geometric.nn import GATConv
 from scipy.stats import norm
 from collections import deque
 import logging
-from stable_baselines3 import PPO  # Placeholder for MuZero
+from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import BaseCallback
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 import lightgbm as lgb
+import optuna
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -34,8 +38,8 @@ class MicrostructureModel:
 
 class TradingEnv:
     def __init__(self, data_dict, options_data_dict, initial_balance=1000, hft_interval=1):
-        self.data_dict = data_dict  # {'AAPL': array, 'TSLA': array, 'BTC': array}
-        self.options_data_dict = options_data_dict  # {'AAPL': {...}, ...}
+        self.data_dict = data_dict
+        self.options_data_dict = options_data_dict
         self.assets = list(data_dict.keys())
         self.current_step = 0
         self.initial_balance = initial_balance
@@ -58,7 +62,7 @@ class TradingEnv:
             self.sentiment_history[asset].clear()
         return self._get_state()
 
-    def step(self, action_dict, sentiment_dict):
+    def step(self, action_dict, sentiment_dict, rf_preds, lr_preds):
         current_prices = {asset: self.data_dict[asset][self.current_step] for asset in self.assets}
         next_prices = {asset: self.data_dict[asset][self.current_step + 1] for asset in self.assets}
         for asset in self.assets:
@@ -74,10 +78,12 @@ class TradingEnv:
             expiry = expiries[int(expiry_idx * (len(expiries) - 1))]
 
             price_dist, vol_dist = self._monte_carlo_forecast(current_prices[asset], self.volatility_dict[asset])
-            stock_vol = self._kelly_position(current_prices[asset], price_dist, 'stock') * np.sign(stock_vol)
-            call_vol = self._kelly_position(current_prices[asset], price_dist, 'call', strike, expiry) * np.sign(call_vol)
-            put_vol = self._kelly_position(current_prices[asset], price_dist, 'put', strike, expiry) * np.sign(put_vol)
-            var_swap_vol = self._kelly_position(current_prices[asset], vol_dist, 'variance_swap') * np.sign(var_swap_vol)
+            rf_boost = 1.1 if rf_preds[asset] == 1 else 0.9  # RF direction boost
+            lr_risk = 0.8 if lr_preds[asset] == 1 else 1.0  # LR high volatility dampener
+            stock_vol = self._kelly_position(current_prices[asset], price_dist, 'stock') * np.sign(stock_vol) * rf_boost * lr_risk
+            call_vol = self._kelly_position(current_prices[asset], price_dist, 'call', strike, expiry) * np.sign(call_vol) * rf_boost * lr_risk
+            put_vol = self._kelly_position(current_prices[asset], price_dist, 'put', strike, expiry) * np.sign(put_vol) * rf_boost * lr_risk
+            var_swap_vol = self._kelly_position(current_prices[asset], vol_dist, 'variance_swap') * np.sign(var_swap_vol) * rf_boost * lr_risk
 
             asset_reward, _ = self._execute_trade(asset, current_prices[asset], next_prices[asset], stock_vol, call_vol, put_vol, strike, expiry, var_swap_vol)
             reward += asset_reward
@@ -218,13 +224,13 @@ class TradingEnv:
             return 0
         win_prob = np.mean(dist > (current_price if asset_type == 'stock' else 0.04 if asset_type == 'variance_swap' else premium))
         kelly_fraction = win_prob - (1 - win_prob) * (loss / profit)
-        return max(0, min(3, kelly_fraction))  # 3x leverage cap
+        return max(0, min(3, kelly_fraction))
 
     def _calculate_cvar(self, return_val, alpha=0.05):
         return -return_val if return_val < 0 else 0
 
 class RLTradingAgent:
-    def __init__(self, state_size=25, action_size=18, initial_balance=1000):  # 3 assets × 6 actions + balance
+    def __init__(self, state_size=25, action_size=18, initial_balance=1000):
         self.state_size = state_size
         self.action_size = action_size
         self.initial_balance = initial_balance
@@ -238,11 +244,15 @@ class RLTradingAgent:
         self.gat = GATConv(in_channels=state_size, out_channels=64, heads=4).to(self.device)
         self.sentiment_analyzer = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english", device=0 if torch.cuda.is_available() else -1)
         self.volatility_model = lgb.LGBMRegressor(n_estimators=200, learning_rate=0.05)
+        self.rf_model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+        self.lr_model = LogisticRegression(max_iter=1000, random_state=42)
+        self.scaler = StandardScaler()
+        self.assets = ['AAPL', 'TSLA', 'BTC-USD']
         
         self.rl = PPO(
             "MlpPolicy",
-            make_vec_env(lambda: TradingEnv({'AAPL': np.zeros(100), 'TSLA': np.zeros(100), 'BTC': np.zeros(100)}, 
-                                           {'AAPL': {90: {5: 10}}, 'TSLA': {90: {5: 10}}, 'BTC': {90: {5: 10}}})),
+            make_vec_env(lambda: TradingEnv({'AAPL': np.zeros(100), 'TSLA': np.zeros(100), 'BTC-USD': np.zeros(100)}, 
+                                           {'AAPL': {90: {5: 10}}, 'TSLA': {90: {5: 10}}, 'BTC-USD': {90: {5: 10}}})),
             learning_rate=5e-5,
             n_steps=2048,
             batch_size=1024,
@@ -252,7 +262,18 @@ class RLTradingAgent:
             ent_coef=0.01,
             device=self.device
         )
-        self.assets = ['AAPL', 'TSLA', 'BTC']
+
+    def _prepare_features(self, data_dict):
+        features_dict = {}
+        for asset in self.assets:
+            data = data_dict[asset]
+            returns = np.diff(np.log(data[-21:])) * 100
+            sma_short = np.mean(data[-6:-1])
+            sma_long = np.mean(data[-21:-1])
+            volatility = self._update_volatility(data)
+            features = np.array([returns[-1], sma_short, sma_long, volatility]).reshape(1, -1)
+            features_dict[asset] = self.scaler.fit_transform(features) if not hasattr(self.scaler, 'mean_') else self.scaler.transform(features)
+        return features_dict
 
     def _encode_state(self, data_dict, sentiment_dict=None, order_book_dict=None):
         state = []
@@ -270,8 +291,8 @@ class RLTradingAgent:
             sentiment = self._analyze_sentiment(sentiment_dict.get(asset, "")) if sentiment_dict else 0.0
             volatility = self._update_volatility(raw_data) if len(raw_data) > 20 else 0.2
             
-            state.extend([time_enc.flatten()[0], gat_enc[0], sentiment, volatility])  # Simplified for size
-        state.append(self.initial_balance)  # Balance as global state
+            state.extend([time_enc.flatten()[0], gat_enc[0], sentiment, volatility])
+        state.append(self.initial_balance)
         return np.array(state, dtype=np.float32)
 
     def _update_volatility(self, price_data):
@@ -292,13 +313,23 @@ class RLTradingAgent:
         result = self.sentiment_analyzer(text)[0]
         score = result['score'] if result['label'] == 'POSITIVE' else -result['score']
         if "bullish" in text.lower() or "breakout" in text.lower():
-            score *= 1.3  # Boost strong signals
+            score *= 1.3
         elif "bearish" in text.lower() or "crash" in text.lower():
-            score *= 0.7  # Dampen weak signals
+            score *= 0.7
         return np.clip(score, -1, 1)
+
+    def _ensemble_predict(self, data_dict):
+        rf_preds = {}
+        lr_preds = {}
+        features_dict = self._prepare_features(data_dict)
+        for asset in self.assets:
+            rf_preds[asset] = self.rf_model.predict(features_dict[asset])[0]  # 1=up, 0=down
+            lr_preds[asset] = self.lr_model.predict(features_dict[asset])[0]  # 1=high vol, 0=low vol
+        return rf_preds, lr_preds
 
     def act(self, data_dict, sentiment_dict=None, order_book_dict=None):
         state = self._encode_state(data_dict, sentiment_dict, order_book_dict)
+        rf_preds, lr_preds = self._ensemble_predict(data_dict)
         action, _ = self.rl.predict(state, deterministic=True)
         action = np.clip(action, -1, 1)
         action_dict = {}
@@ -306,11 +337,58 @@ class RLTradingAgent:
             start_idx = i * 6
             action_dict[asset] = action[start_idx:start_idx + 6]
             action_dict[asset][3:5] = (action_dict[asset][3:5] + 1) / 2  # Strike/expiry
-        return action_dict
+        return action_dict, rf_preds, lr_preds
+
+    def train_supervised(self, data_dict):
+        for asset in self.assets:
+            data = data_dict[asset]
+            returns = np.diff(np.log(data)) * 100
+            X = pd.DataFrame({
+                'lag1': np.roll(returns, 1)[1:],
+                'lag5': np.roll(returns, 5)[1:],
+                'lag22': np.roll(returns, 22)[1:],
+                'sma_short': np.convolve(data, np.ones(5)/5, mode='valid')[:-1],
+                'sma_long': np.convolve(data, np.ones(20)/20, mode='valid')[:-1]
+            }).dropna()
+            y_rf = (np.sign(returns[19:]) + 1) // 2  # 1=up, 0=down
+            y_lr = (np.abs(returns[19:]) > np.percentile(np.abs(returns), 75)).astype(int)  # 1=high vol
+            X_scaled = self.scaler.fit_transform(X)
+            self.rf_model.fit(X_scaled, y_rf)
+            self.lr_model.fit(X_scaled, y_lr)
+
+    def tune_hyperparameters(self, data_dict, trials=50):
+        def objective(trial):
+            rf_params = {
+                'n_estimators': trial.suggest_int('rf_n_estimators', 50, 200),
+                'max_depth': trial.suggest_int('rf_max_depth', 5, 20)
+            }
+            lr_params = {
+                'C': trial.suggest_loguniform('lr_C', 1e-5, 1e2)
+            }
+            ppo_params = {
+                'learning_rate': trial.suggest_loguniform('ppo_lr', 1e-5, 1e-3),
+                'n_steps': trial.suggest_int('ppo_n_steps', 1024, 4096),
+                'batch_size': trial.suggest_int('ppo_batch_size', 256, 1024)
+            }
+            
+            self.rf_model = RandomForestClassifier(**rf_params, random_state=42)
+            self.lr_model = LogisticRegression(**lr_params, max_iter=1000, random_state=42)
+            self.rl = PPO("MlpPolicy", self.rl.env, **ppo_params, gamma=0.999, gae_lambda=0.95, ent_coef=0.01, device=self.device)
+            
+            self.train_supervised(data_dict)
+            self.rl.learn(total_timesteps=10000)  # Short run for tuning
+            results = self.backtest(data_dict, options_data_dict, sentiment_dict_list, days=30)
+            return results['final_balance']
+
+        study = optuna.create_study(direction='maximize')
+        study.optimize(objective, n_trials=trials)
+        logging.info(f"Best params: {study.best_params}")
+        return study.best_params
 
     def train(self, data_dict, options_data_dict, sentiment_dict_list, episodes=500, timesteps_per_episode=5000):
         env = TradingEnv(data_dict, options_data_dict)
         self.rl.env = make_vec_env(lambda: env, n_envs=8)
+        self.train_supervised(data_dict)
         
         class RiskCallback(BaseCallback):
             def __init__(self, verbose=0):
@@ -326,14 +404,14 @@ class RLTradingAgent:
                     return False
                 return True
 
-        sentiment_dict_list = sentiment_dict_list if sentiment_dict_list else [{'AAPL': None, 'TSLA': None, 'BTC': None}] * max(len(data) for data in data_dict.values())
+        sentiment_dict_list = sentiment_dict_list if sentiment_dict_list else [{'AAPL': None, 'TSLA': None, 'BTC-USD': None}] * max(len(data) for data in data_dict.values())
         for episode in range(episodes):
             obs = env.reset()
             for t in range(timesteps_per_episode):
-                action = self.act({asset: data[:env.current_step + 1] for asset, data in data_dict.items()}, 
-                                  sentiment_dict_list[env.current_step])
+                action, rf_preds, lr_preds = self.act({asset: data[:env.current_step + 1] for asset, data in data_dict.items()}, 
+                                                      sentiment_dict_list[env.current_step])
                 obs, reward, done, _ = env.step(action, {asset: self._analyze_sentiment(sentiment_dict_list[env.current_step][asset]) 
-                                                        for asset in self.assets})
+                                                        for asset in self.assets}, rf_preds, lr_preds)
                 if done:
                     break
         self.rl.learn(total_timesteps=episodes * timesteps_per_episode, callback=RiskCallback())
@@ -343,13 +421,13 @@ class RLTradingAgent:
         env = TradingEnv(data_dict, options_data_dict, initial_balance=initial_balance)
         obs = env.reset()
         portfolio_values = [initial_balance]
-        steps_per_day = 390 * 60  # 1-second ticks per trading day
+        steps_per_day = 390 * 60
         total_steps = days * steps_per_day
         
-        sentiment_dict_list = sentiment_dict_list if sentiment_dict_list else [{'AAPL': None, 'TSLA': None, 'BTC': None}] * max(len(data) for data in data_dict.values())
+        sentiment_dict_list = sentiment_dict_list if sentiment_dict_list else [{'AAPL': None, 'TSLA': None, 'BTC-USD': None}] * max(len(data) for data in data_dict.values())
         for t in range(min(total_steps, env.max_steps)):
-            action = self.act({asset: data[:t + 1] for asset, data in data_dict.items()}, sentiment_dict_list[t])
-            obs, reward, done, _ = env.step(action, {asset: self._analyze_sentiment(sentiment_dict_list[t][asset]) for asset in env.assets})
+            action, rf_preds, lr_preds = self.act({asset: data[:t + 1] for asset, data in data_dict.items()}, sentiment_dict_list[t])
+            obs, reward, done, _ = env.step(action, {asset: self._analyze_sentiment(sentiment_dict_list[t][asset]) for asset in env.assets}, rf_preds, lr_preds)
             portfolio_value = sum(env._portfolio_value(asset, env.data_dict[asset][t + 1]) for asset in env.assets) + env.balance
             portfolio_values.append(portfolio_value)
             if done:
@@ -370,27 +448,24 @@ class RLTradingAgent:
 
 # Example usage with backtest
 if __name__ == "__main__":
-    # Simulate UHF data with correlated GBM
     tickers = ['AAPL', 'TSLA', 'BTC-USD']
     data_dict = {}
-    dt = 1 / (252 * 390 * 60)  # 1-second ticks
+    dt = 1 / (252 * 390 * 60)
     for ticker in tickers:
         data = yf.download(ticker, interval="1d", period="2y")['Close'].values
         volatility = np.std(np.diff(np.log(data))) * np.sqrt(252)
         uhf_data = [data[0]]
-        for i in range(30 * 390 * 60 - 1):  # 30 days of 1-second data
+        for i in range(30 * 390 * 60 - 1):
             dW = np.random.normal(0, np.sqrt(dt))
             uhf_data.append(uhf_data[-1] * np.exp((0.02 - 0.5 * volatility ** 2) * dt + volatility * dW))
         data_dict[ticker] = np.array(uhf_data)
     
-    # Synthetic options data (simplified)
     options_data_dict = {
         'AAPL': {data_dict['AAPL'][-1] * 0.9: {5/252: 10}, data_dict['AAPL'][-1]: {5/252: 8}, data_dict['AAPL'][-1] * 1.1: {5/252: 6}},
         'TSLA': {data_dict['TSLA'][-1] * 0.9: {5/252: 10}, data_dict['TSLA'][-1]: {5/252: 8}, data_dict['TSLA'][-1] * 1.1: {5/252: 6}},
         'BTC-USD': {data_dict['BTC-USD'][-1] * 0.9: {5/252: 100}, data_dict['BTC-USD'][-1]: {5/252: 80}, data_dict['BTC-USD'][-1] * 1.1: {5/252: 60}}
     }
     
-    # Synthetic sentiment data (daily X posts)
     sentiment_dict_list = [
         {'AAPL': "Apple AI innovations soar!", 'TSLA': "Tesla breaks production records", 'BTC-USD': "Bitcoin rallies on ETF news"},
         {'AAPL': "Tech stocks under pressure", 'TSLA': "Elon tweets spark volatility", 'BTC-USD': "Crypto market cautious"},
@@ -398,11 +473,9 @@ if __name__ == "__main__":
     ] * (30 * 390 * 60 // 3 + 1)
     sentiment_dict_list = sentiment_dict_list[:30 * 390 * 60]
     
-    # Initialize and train
     agent = RLTradingAgent(state_size=25, action_size=18)
+    best_params = agent.tune_hyperparameters(data_dict, trials=10)  # Reduced trials for demo
     agent.train(data_dict, options_data_dict, sentiment_dict_list)
-    
-    # Backtest for 30 days
     results = agent.backtest(data_dict, options_data_dict, sentiment_dict_list, days=30)
     print(f"Final Balance: ${results['final_balance']:.2f}")
     print(f"Annualized Return: {results['annualized_return']:.2f}%")
